@@ -1,5 +1,6 @@
 """Shared Anthropic streaming engine."""
 
+from .decoder import AnthropicSSEDecoder
 from .emitter import (
     ANTHROPIC_SSE_RESPONSE_HEADERS,
     AnthropicSseEmitter,
@@ -13,7 +14,6 @@ from .recovery import (
     ToolSchema,
     accept_tool_json_repair,
     continuation_suffix,
-    make_text_recovery_body,
     make_tool_repair_body,
     parse_complete_tool_input,
     tool_schemas_by_name,
@@ -21,6 +21,7 @@ from .recovery import (
 
 __all__ = [
     "ANTHROPIC_SSE_RESPONSE_HEADERS",
+    "AnthropicSSEDecoder",
     "AnthropicSseEmitter",
     "AnthropicStreamLedger",
     "StreamBlockLedger",
@@ -31,7 +32,6 @@ __all__ = [
     "anthropic_terminal_failure_frame",
     "continuation_suffix",
     "format_sse_event",
-    "make_text_recovery_body",
     "make_tool_repair_body",
     "map_stop_reason",
     "parse_complete_tool_input",

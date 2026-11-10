@@ -3,9 +3,13 @@ set -eu
 
 PACKAGE_NAME="free-claude-code"
 FCC_HOME_DIRNAME=".fcc"
-FCC_COMMANDS="fcc-server fcc-claude fcc-codex fcc-pi fcc-init free-claude-code"
+FCC_MACOS_BUNDLE_ID="io.github.alishahryar1.free-claude-code"
+FCC_MACOS_OWNER_FILE=".free-claude-code-owner"
+# Include retired entry points so older installations are fully stopped and removed.
+FCC_COMMANDS="fcc-desktop fcc-server fcc-claude fcc-codex fcc-pi fcc-opencode fcc-cline fcc-hermes fcc-dsh fcc-grok fcc-muse fcc-aider fcc-agy fcc-doctor fcc-update fcc-init free-claude-code"
 
 dry_run=0
+keep_integrations=0
 uv_tool_bin=""
 
 show_usage() {
@@ -13,10 +17,11 @@ show_usage() {
 Usage: uninstall.sh [options]
 
 Removes the Free Claude Code uv tool and deletes ~/.fcc/ after removal is verified.
-Does not remove uv, Claude Code, Codex, Pi, the uv-managed Python runtime, or shared PATH entries.
+Does not remove uv, Claude Code, Codex, Pi, OpenCode, Cline, Hermes Agent, DeepSeek Harness, Grok Build, Muse Code, Aider, Antigravity CLI, the uv-managed Python runtime, or shared PATH entries.
 
 Options:
   --dry-run                Print commands without running them.
+  --keep-integrations      Leave editor/app integrations unchanged.
   --help                   Show this help text.
 USAGE
 }
@@ -91,20 +96,34 @@ add_known_uv_paths() {
     hash -r 2>/dev/null || true
 }
 
-is_fcc_command_running() {
+fcc_process_ids() {
     command_name=$1
 
     if command -v pgrep >/dev/null 2>&1; then
-        if pgrep -x "$command_name" >/dev/null 2>&1; then
-            return 0
-        fi
-        if pgrep -f "(^|/)${command_name}( |$)" >/dev/null 2>&1; then
-            return 0
-        fi
-        return 1
+        {
+            pgrep -x "$command_name" 2>/dev/null || true
+            pgrep -f "(^|/)${command_name}([[:space:]]|$)" 2>/dev/null || true
+        } | sort -nu
+        return 0
     fi
 
-    ps -A -o comm= 2>/dev/null | grep -qx "$command_name"
+    ps -A -o pid= -o args= 2>/dev/null |
+        awk -v command_name="$command_name" '
+            BEGIN {
+                pattern = "(^|/)" command_name "([[:space:]]|$)"
+            }
+            {
+                process_id = $1
+                sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "")
+                if ($0 ~ pattern) {
+                    print process_id
+                }
+            }
+        ' || true
+}
+
+is_fcc_command_running() {
+    [ -n "$(fcc_process_ids "$1")" ]
 }
 
 assert_no_fcc_processes_running() {
@@ -167,6 +186,23 @@ uninstall_free_claude_code() {
     fail "uv tool uninstall $PACKAGE_NAME failed with exit code $status; ~/.fcc was not deleted."
 }
 
+disconnect_integrations() {
+    [ "$keep_integrations" -eq 0 ] || return 0
+    if [ "$dry_run" -eq 1 ]; then
+        print_command fcc-doctor --disconnect-integrations
+        return 0
+    fi
+    doctor="$uv_tool_bin/fcc-doctor"
+    if [ ! -x "$doctor" ]; then
+        fail "FCC's integration cleanup command is unavailable. Update FCC first, or disconnect editor/app integrations manually and rerun with --keep-integrations. FCC data was not deleted."
+    fi
+    print_command "$doctor" --disconnect-integrations
+    if "$doctor" --disconnect-integrations; then
+        return 0
+    fi
+    fail "Editor/app integration cleanup failed. Correct the reported problem and retry. For older FCC versions, update first or disconnect manually and rerun with --keep-integrations. FCC and its data were not deleted."
+}
+
 verify_fcc_commands_removed() {
     if [ "$dry_run" -eq 1 ]; then
         printf '+ verify all Free Claude Code entry points are absent from the uv tool bin directory\n'
@@ -174,7 +210,7 @@ verify_fcc_commands_removed() {
     fi
 
     remaining=""
-    for command_name in $FCC_COMMANDS; do
+    for command_name in $FCC_COMMANDS fcc-update.cmd; do
         command_path="$uv_tool_bin/$command_name"
         if [ -e "$command_path" ] || [ -L "$command_path" ]; then
             remaining="${remaining} ${command_path}"
@@ -182,6 +218,47 @@ verify_fcc_commands_removed() {
     done
     if [ -n "$remaining" ]; then
         fail "Free Claude Code entry points remain after uv uninstall:${remaining}; ~/.fcc was not deleted."
+    fi
+}
+
+macos_app_is_fcc_owned() {
+    app_dir=$1
+    [ -d "$app_dir" ] && [ ! -L "$app_dir" ] || return 1
+    for owner_file in "$app_dir/Contents/Resources/$FCC_MACOS_OWNER_FILE" "$app_dir/Contents/$FCC_MACOS_OWNER_FILE"; do
+        if [ -f "$owner_file" ] && [ "$(cat "$owner_file")" = "$FCC_MACOS_BUNDLE_ID" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+remove_macos_desktop_app() {
+    [ "$(uname -s)" = "Darwin" ] || return 0
+
+    app_dir="$HOME/Applications/Free Claude Code.app"
+    desktop_link="$HOME/Desktop/Free Claude Code.app"
+
+    if ! macos_app_is_fcc_owned "$app_dir"; then
+        if [ -e "$app_dir" ] || [ -L "$app_dir" ]; then
+            printf 'An app not managed by Free Claude Code exists at %s; leaving it unchanged.\n' "$app_dir"
+        fi
+        if [ -e "$desktop_link" ] || [ -L "$desktop_link" ]; then
+            printf 'The Free Claude Code desktop item cannot be verified; leaving it unchanged.\n'
+        fi
+        return 0
+    fi
+
+    if [ -L "$desktop_link" ]; then
+        if [ "$(readlink "$desktop_link")" = "$app_dir" ]; then
+            run rm -f "$desktop_link"
+        else
+            printf 'A non-FCC link exists at %s; leaving it unchanged.\n' "$desktop_link"
+        fi
+    elif [ -e "$desktop_link" ]; then
+        printf 'A non-FCC item exists at %s; leaving it unchanged.\n' "$desktop_link"
+    fi
+    if [ -e "$app_dir" ]; then
+        run rm -rf "$app_dir"
     fi
 }
 
@@ -203,6 +280,9 @@ parse_args() {
         case "$1" in
             --dry-run)
                 dry_run=1
+                ;;
+            --keep-integrations)
+                keep_integrations=1
                 ;;
             --help|-h)
                 show_usage
@@ -226,11 +306,17 @@ assert_no_fcc_processes_running
 step "Locating the uv-managed Free Claude Code installation"
 initialize_uv_context
 
+step "Disconnecting FCC editor/app integrations"
+disconnect_integrations
+
 step "Removing the Free Claude Code uv tool"
 uninstall_free_claude_code
 
 step "Verifying Free Claude Code entry points were removed"
 verify_fcc_commands_removed
+
+step "Removing the Free Claude Code desktop launcher"
+remove_macos_desktop_app
 
 step "Purging FCC config and data from ~/.fcc"
 purge_fcc_home
@@ -239,5 +325,5 @@ if [ "$dry_run" -eq 1 ]; then
     printf '\nDry run complete. No changes were made.\n'
 else
     printf '\nFree Claude Code has been removed and verified.\n'
-    printf 'uv, Claude Code, Codex, Pi, the uv-managed Python runtime, and shared PATH entries were left installed.\n'
+    printf 'uv, Claude Code, Codex, Pi, OpenCode, Cline, Hermes Agent, DeepSeek Harness, Grok Build, Muse Code, Aider, the uv-managed Python runtime, and shared PATH entries were left installed.\n'
 fi

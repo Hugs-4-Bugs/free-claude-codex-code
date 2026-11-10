@@ -5,14 +5,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import openai
 import pytest
-from httpx import Request, Response
+from httpx2 import Request, Response
 
-from free_claude_code.config.nim import NimSettings
 from free_claude_code.core.failures import ExecutionFailure
-from free_claude_code.providers.base import ProviderConfig
+from free_claude_code.providers.admission import UPSTREAM_TRANSIENT_TOTAL_ATTEMPTS
 from free_claude_code.providers.nvidia_nim import NvidiaNimProvider
 from tests.providers.request_factory import make_messages_request
-from tests.providers.support import retrying_rate_limiter
+from tests.providers.support import (
+    SDKStreamDouble,
+    immediate_admission,
+    make_provider_config,
+)
 
 
 def _internal_5xx(code: int) -> openai.InternalServerError:
@@ -34,19 +37,16 @@ def _connection_error(message: str = "connect failed") -> openai.APIConnectionEr
 @pytest.mark.parametrize("status_code", [500, 502, 503, 504])
 @pytest.mark.asyncio
 async def test_nim_stream_retries_on_openai_5xx_then_streams(status_code):
-    config = ProviderConfig(
+    config = make_provider_config(
         api_key="test_key",
         base_url="https://test.api.nvidia.com/v1",
-        rate_limit=100,
-        rate_window=60,
         http_read_timeout=600.0,
         http_write_timeout=15.0,
         http_connect_timeout=5.0,
     )
     provider = NvidiaNimProvider(
         config,
-        nim_settings=NimSettings(),
-        rate_limiter=retrying_rate_limiter(),
+        admission=immediate_admission(),
     )
     req = make_messages_request()
 
@@ -69,8 +69,11 @@ async def test_nim_stream_retries_on_openai_5xx_then_streams(status_code):
             new_callable=AsyncMock,
         ) as mock_create,
     ):
-        mock_create.side_effect = [_internal_5xx(status_code), mock_stream()]
-        events = [e async for e in provider.stream_response(req)]
+        mock_create.side_effect = [
+            _internal_5xx(status_code),
+            SDKStreamDouble(mock_stream()),
+        ]
+        events = [e async for e in provider.stream_messages(req)]
 
     assert mock_create.await_count == 2
     assert any("Hi" in e for e in events)
@@ -78,19 +81,16 @@ async def test_nim_stream_retries_on_openai_5xx_then_streams(status_code):
 
 @pytest.mark.asyncio
 async def test_nim_stream_retries_on_pre_stream_connection_error_then_streams():
-    config = ProviderConfig(
+    config = make_provider_config(
         api_key="test_key",
         base_url="https://test.api.nvidia.com/v1",
-        rate_limit=100,
-        rate_window=60,
         http_read_timeout=600.0,
         http_write_timeout=15.0,
         http_connect_timeout=5.0,
     )
     provider = NvidiaNimProvider(
         config,
-        nim_settings=NimSettings(),
-        rate_limiter=retrying_rate_limiter(),
+        admission=immediate_admission(),
     )
     req = make_messages_request()
 
@@ -113,8 +113,8 @@ async def test_nim_stream_retries_on_pre_stream_connection_error_then_streams():
             new_callable=AsyncMock,
         ) as mock_create,
     ):
-        mock_create.side_effect = [_connection_error(), mock_stream()]
-        events = [e async for e in provider.stream_response(req)]
+        mock_create.side_effect = [_connection_error(), SDKStreamDouble(mock_stream())]
+        events = [e async for e in provider.stream_messages(req)]
 
     assert mock_create.await_count == 2
     assert any("Recovered" in e for e in events)
@@ -122,19 +122,16 @@ async def test_nim_stream_retries_on_pre_stream_connection_error_then_streams():
 
 @pytest.mark.asyncio
 async def test_nim_stream_connection_error_exhausted_emits_cause_chain():
-    config = ProviderConfig(
+    config = make_provider_config(
         api_key="test_key",
         base_url="https://test.api.nvidia.com/v1",
-        rate_limit=100,
-        rate_window=60,
         http_read_timeout=600.0,
         http_write_timeout=15.0,
         http_connect_timeout=5.0,
     )
     provider = NvidiaNimProvider(
         config,
-        nim_settings=NimSettings(),
-        rate_limiter=retrying_rate_limiter(),
+        admission=immediate_admission(),
     )
     req = make_messages_request()
     error = _connection_error("upstream disconnected")
@@ -146,12 +143,12 @@ async def test_nim_stream_connection_error_exhausted_emits_cause_chain():
             new_callable=AsyncMock,
             side_effect=error,
         ) as mock_create,
-        patch("free_claude_code.providers.openai_chat.provider.trace_event") as trace,
+        patch("free_claude_code.providers.openai_chat.transport.trace_event") as trace,
         pytest.raises(ExecutionFailure) as exc_info,
     ):
-        [e async for e in provider.stream_response(req, request_id="req_conn")]
+        [e async for e in provider.stream_messages(req, request_id="req_conn")]
 
-    assert mock_create.await_count == 5
+    assert mock_create.await_count == UPSTREAM_TRANSIENT_TOTAL_ATTEMPTS
     error_traces = [
         call.kwargs
         for call in trace.call_args_list
@@ -177,19 +174,16 @@ async def test_nim_stream_openai_5xx_exhausted_emits_user_message(
     status_code,
     expect_substr,
 ):
-    config = ProviderConfig(
+    config = make_provider_config(
         api_key="test_key",
         base_url="https://test.api.nvidia.com/v1",
-        rate_limit=100,
-        rate_window=60,
         http_read_timeout=600.0,
         http_write_timeout=15.0,
         http_connect_timeout=5.0,
     )
     provider = NvidiaNimProvider(
         config,
-        nim_settings=NimSettings(),
-        rate_limiter=retrying_rate_limiter(),
+        admission=immediate_admission(),
     )
     req = make_messages_request()
 
@@ -202,7 +196,7 @@ async def test_nim_stream_openai_5xx_exhausted_emits_user_message(
     ):
         mock_create.side_effect = _internal_5xx(status_code)
         with pytest.raises(ExecutionFailure) as exc_info:
-            [e async for e in provider.stream_response(req)]
+            [e async for e in provider.stream_messages(req)]
 
-    assert mock_create.await_count == 5
+    assert mock_create.await_count == UPSTREAM_TRANSIENT_TOTAL_ATTEMPTS
     assert expect_substr in exc_info.value.message.lower()

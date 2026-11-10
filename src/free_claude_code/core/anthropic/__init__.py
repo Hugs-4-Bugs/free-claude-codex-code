@@ -27,6 +27,7 @@ from .models import (
     Message,
     MessagesRequest,
     MessagesResponse,
+    NativeTokenCountRequest,
     SystemContent,
     ThinkingConfig,
     TokenCountRequest,
@@ -46,7 +47,6 @@ from .streaming import (
 )
 from .thinking import ContentChunk, ContentType, ThinkTagParser
 from .tokens import get_token_count
-from .tools import HeuristicToolParser
 from .utils import set_if_not_none
 
 __all__ = [
@@ -64,10 +64,10 @@ __all__ = [
     "ContentBlockWebSearchToolResult",
     "ContentChunk",
     "ContentType",
-    "HeuristicToolParser",
     "Message",
     "MessagesRequest",
     "MessagesResponse",
+    "NativeTokenCountRequest",
     "OpenAIConversionError",
     "ReasoningReplayMode",
     "StreamBlockLedger",

@@ -4,10 +4,9 @@ from pathlib import Path
 
 import pytest
 
-from free_claude_code.cli.claude_env import build_claude_proxy_env
+from free_claude_code.harnesses.claude import build_claude_proxy_env
 from smoke.lib.child_process import (
-    cmd_fcc_init,
-    cmd_free_claude_code_serve,
+    cmd_fcc_server,
     run_captured_text,
 )
 from smoke.lib.config import SmokeConfig
@@ -17,27 +16,10 @@ from smoke.lib.skips import skip_upstream_unavailable
 pytestmark = [pytest.mark.live, pytest.mark.smoke_target("cli")]
 
 
-def test_fcc_init_scaffolds_user_config(
-    smoke_config: SmokeConfig, tmp_path: Path
-) -> None:
-    env = os.environ.copy()
-    env["HOME"] = str(tmp_path)
-    env["USERPROFILE"] = str(tmp_path)
-    result = run_captured_text(
-        cmd_fcc_init(),
-        cwd=smoke_config.root,
-        env=env,
-        timeout=smoke_config.timeout_s,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr or result.stdout
-    assert (tmp_path / ".fcc" / ".env").is_file()
-
-
-def test_free_claude_code_entrypoint_starts_server(smoke_config: SmokeConfig) -> None:
+def test_fcc_server_entrypoint_starts_server(smoke_config: SmokeConfig) -> None:
     with start_server(
         smoke_config,
-        command=cmd_free_claude_code_serve(),
+        command=cmd_fcc_server(),
         env_overrides={"MESSAGING_PLATFORM": "none"},
         name="entrypoint",
     ) as server:
@@ -61,7 +43,7 @@ def test_claude_cli_prompt_when_available(
     ) as server:
         env = build_claude_proxy_env(
             proxy_root_url=server.base_url,
-            auth_token=smoke_config.settings.anthropic_auth_token,
+            auth_token=smoke_config.settings.proxy_auth_token,
             base_env=os.environ,
         )
         result = run_captured_text(

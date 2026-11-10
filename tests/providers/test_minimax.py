@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from free_claude_code.application.model_metadata import ProviderModelInfo
 from free_claude_code.config.constants import ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS
 from free_claude_code.config.provider_catalog import MINIMAX_DEFAULT_BASE
 from free_claude_code.core.anthropic.models import Message, MessagesRequest, Tool
@@ -13,23 +14,22 @@ from free_claude_code.core.anthropic.stream_contracts import (
     text_content,
     thinking_content,
 )
-from free_claude_code.providers.base import ProviderConfig
 from free_claude_code.providers.openai_chat import OpenAIChatProvider
 from tests.providers.support import (
     REASONING_OFF,
-    passthrough_rate_limiter,
+    SDKStreamDouble,
+    immediate_admission,
+    make_provider_config,
     profiled_provider,
     reasoning_for,
 )
 
 
-class AsyncStream:
+class AsyncStream(SDKStreamDouble):
     def __init__(self, chunks):
         self._chunks = chunks
         self.closed = False
-
-    def __aiter__(self):
-        return self._iter()
+        super().__init__(self._iter(), close=self.aclose)
 
     async def _iter(self):
         for chunk in self._chunks:
@@ -43,13 +43,11 @@ class AsyncStream:
 def minimax_provider():
     return profiled_provider(
         "minimax",
-        ProviderConfig(
+        make_provider_config(
             api_key="test-minimax-key",
             base_url=MINIMAX_DEFAULT_BASE,
-            rate_limit=10,
-            rate_window=60,
         ),
-        rate_limiter=passthrough_rate_limiter(),
+        admission=immediate_admission(),
     )
 
 
@@ -99,7 +97,7 @@ def test_build_request_body_requests_split_output_and_max_completion_tokens(
         }
     )
 
-    body = minimax_provider._build_request_body(
+    body = minimax_provider._chat._build_request_body(
         request, reasoning=reasoning_for(request)
     )
 
@@ -118,7 +116,7 @@ def test_build_request_body_does_not_invent_unsupported_compute_control(
         messages=[Message(role="user", content="Hello")],
     )
 
-    body = minimax_provider._build_request_body(request, reasoning=REASONING_OFF)
+    body = minimax_provider._chat._build_request_body(request, reasoning=REASONING_OFF)
 
     assert body["extra_body"] == {"reasoning_split": True}
 
@@ -131,8 +129,8 @@ async def test_lists_models_from_openai_models_endpoint(minimax_provider):
         )
     )
 
-    assert await minimax_provider.list_model_ids() == frozenset(
-        {"MiniMax-M3", "MiniMax-M2.7"}
+    assert await minimax_provider.list_model_infos() == frozenset(
+        {ProviderModelInfo("MiniMax-M3"), ProviderModelInfo("MiniMax-M2.7")}
     )
 
 
@@ -155,7 +153,7 @@ async def test_stream_preserves_reasoning_content(minimax_provider):
         new_callable=AsyncMock,
         return_value=stream,
     ) as create:
-        events = [event async for event in minimax_provider.stream_response(request)]
+        events = [event async for event in minimax_provider.stream_messages(request)]
 
     parsed = parse_sse_text("".join(events))
     assert thinking_content(parsed) == "plan"

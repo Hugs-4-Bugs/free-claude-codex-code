@@ -1,28 +1,29 @@
 """OpenRouter provider implementation."""
 
 import json
-from collections.abc import Iterator, Mapping, Sequence
-from typing import Any
+from collections.abc import Mapping
 
 from free_claude_code.application.model_metadata import ProviderModelInfo
 from free_claude_code.config.constants import ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS
 from free_claude_code.core.anthropic import ReasoningReplayMode
-from free_claude_code.core.anthropic.models import MessagesRequest
-from free_claude_code.core.anthropic.streaming import AnthropicStreamLedger
-from free_claude_code.core.reasoning import ReasoningEffort, ReasoningPolicy
+from free_claude_code.core.diagnostics import extract_upstream_error_detail
+from free_claude_code.core.failures import ExecutionFailure, FailureKind
+from free_claude_code.core.reasoning import ReasoningEffort
+from free_claude_code.providers.admission import ProviderAdmissionController
 from free_claude_code.providers.base import ProviderConfig
-from free_claude_code.providers.model_listing import (
-    extract_openrouter_tool_model_ids,
-    extract_openrouter_tool_model_infos,
-)
+from free_claude_code.providers.history_negotiation import HistoryModeCache
+from free_claude_code.providers.model_listing import extract_tool_capable_model_infos
 from free_claude_code.providers.openai_chat import (
+    OpenAIChatBehavior,
     OpenAIChatProfile,
     OpenAIChatProvider,
     OpenAIChatRequestPolicy,
     ReasoningObject,
     validate_extra_body_does_not_override_canonical_fields,
 )
-from free_claude_code.providers.rate_limit import ProviderRateLimiter
+from free_claude_code.providers.reasoning_compatibility import (
+    reasoning_control_rejected,
+)
 
 _REQUEST_POLICY = OpenAIChatRequestPolicy(
     provider_name="OPENROUTER",
@@ -33,168 +34,86 @@ _REQUEST_POLICY = OpenAIChatRequestPolicy(
 )
 
 
+class OpenRouterChatBehavior(OpenAIChatBehavior):
+    """OpenRouter Chat adaptation without HTTP ownership."""
+
+    def failure_override(self, error: Exception) -> ExecutionFailure | None:
+        if getattr(error, "status_code", None) != 404:
+            return None
+        body = getattr(error, "body", None)
+        if isinstance(body, Mapping) and "error" in body:
+            if any(field in body for field in ("code", "message", "metadata")):
+                return None
+            body = body["error"]
+        if not isinstance(body, Mapping):
+            return None
+        code = body.get("code")
+        if not isinstance(code, int) or code != 404:
+            return None
+        if not isinstance(body.get("message"), str):
+            return None
+        metadata = body.get("metadata")
+        if (
+            not isinstance(metadata, Mapping)
+            or metadata.get("failed_routing_step") != "Filter by Image Support"
+        ):
+            return None
+        return ExecutionFailure(
+            FailureKind.INVALID_REQUEST,
+            400,
+            "No OpenRouter endpoint for this request supports image input. "
+            "Remove the image or choose an image-capable model.",
+            False,
+        )
+
+    def reasoning_disable_rejected(self, error: Exception) -> bool:
+        detail = extract_upstream_error_detail(error)
+        if detail.status_code not in {None, 200}:
+            return False
+        try:
+            payload = json.loads(detail.body_text or "")
+        except ValueError:
+            return False
+        if not isinstance(payload, dict):
+            return False
+        error_body = payload.get("error", payload)
+        if not isinstance(error_body, dict):
+            return False
+        code = error_body.get("code")
+        return (
+            isinstance(code, int)
+            and code == 400
+            and reasoning_control_rejected(error_body, ("reasoning",))
+        )
+
+
 class OpenRouterProvider(OpenAIChatProvider):
     """OpenRouter provider using the OpenAI-compatible Chat Completions API."""
 
-    def __init__(self, config: ProviderConfig, *, rate_limiter: ProviderRateLimiter):
+    def __init__(
+        self,
+        config: ProviderConfig,
+        *,
+        admission: ProviderAdmissionController,
+        history_cache: HistoryModeCache | None = None,
+    ):
         super().__init__(
             config,
-            profile=_PROFILE,
-            rate_limiter=rate_limiter,
-        )
-
-    async def list_model_ids(self) -> frozenset[str]:
-        """Only advertise OpenRouter models that can run Claude Code tools."""
-        payload = await self._client.models.list()
-        return extract_openrouter_tool_model_ids(
-            payload, provider_name=self._provider_name
+            behavior=OpenRouterChatBehavior(_PROFILE),
+            admission=admission,
+            history_cache=history_cache,
         )
 
     async def list_model_infos(self) -> frozenset[ProviderModelInfo]:
         """Advertise OpenRouter tool models with reasoning capability metadata."""
-        payload = await self._client.models.list()
-        return extract_openrouter_tool_model_infos(
+        payload = await self._list_models_payload()
+        return extract_tool_capable_model_infos(
             payload, provider_name=self._provider_name
         )
-
-    def _handle_extra_reasoning(
-        self, delta: Any, ledger: AnthropicStreamLedger, *, output_reasoning: bool
-    ) -> Iterator[str]:
-        """Map OpenRouter reasoning details onto Anthropic thinking blocks."""
-        if not output_reasoning:
-            return iter(())
-        return _iter_openrouter_reasoning_detail_events(delta, ledger)
-
-
-def _apply_openrouter_reasoning_details_replay(
-    body: dict[str, Any], request: MessagesRequest, _policy: ReasoningPolicy
-) -> None:
-    assistant_details = _assistant_reasoning_details(request.messages)
-    if not assistant_details:
-        return
-    messages = body.get("messages")
-    if not isinstance(messages, list):
-        return
-
-    cursor = 0
-    for details in assistant_details:
-        for index in range(cursor, len(messages)):
-            message = messages[index]
-            if not isinstance(message, dict) or message.get("role") != "assistant":
-                continue
-            existing = message.get("reasoning_details")
-            if isinstance(existing, list):
-                existing.extend(details)
-            else:
-                message["reasoning_details"] = list(details)
-            cursor = index + 1
-            break
 
 
 _PROFILE = OpenAIChatProfile(
     _REQUEST_POLICY,
     ReasoningObject(tuple((effort, effort.value) for effort in ReasoningEffort)),
-    postprocessors=(_apply_openrouter_reasoning_details_replay,),
+    structured_reasoning_details=True,
 )
-
-
-def _assistant_reasoning_details(messages: Any) -> list[list[dict[str, Any]]]:
-    if not _is_sequence(messages):
-        return []
-    result: list[list[dict[str, Any]]] = []
-    for message in messages:
-        if _field(message, "role") != "assistant":
-            continue
-        details = _redacted_reasoning_details(_field(message, "content"))
-        if details:
-            result.append(details)
-    return result
-
-
-def _redacted_reasoning_details(content: Any) -> list[dict[str, Any]]:
-    if not _is_sequence(content):
-        return []
-    details: list[dict[str, Any]] = []
-    for block in content:
-        if _field(block, "type") != "redacted_thinking":
-            continue
-        data = _field(block, "data")
-        if not isinstance(data, str) or not data:
-            continue
-        parsed = _json_payload(data)
-        if isinstance(parsed, list):
-            details.extend(item for item in parsed if isinstance(item, dict))
-        elif isinstance(parsed, dict):
-            details.append(parsed)
-        else:
-            details.append({"type": "reasoning.encrypted", "data": data})
-    return details
-
-
-def _iter_openrouter_reasoning_detail_events(
-    delta: Any, ledger: AnthropicStreamLedger
-) -> Iterator[str]:
-    details = _field(delta, "reasoning_details")
-    if details is None:
-        extra = _field(delta, "model_extra")
-        if isinstance(extra, Mapping):
-            details = extra.get("reasoning_details")
-    if not _is_sequence(details):
-        return
-
-    native_reasoning = _field(delta, "reasoning_content")
-    has_native_reasoning = isinstance(native_reasoning, str) and bool(native_reasoning)
-    for detail in details:
-        encrypted = _reasoning_detail_encrypted(detail)
-        if encrypted:
-            yield from ledger.close_content_blocks()
-            index = ledger.blocks.allocate_index()
-            yield ledger.content_block_start(index, "redacted_thinking", data=encrypted)
-            yield ledger.content_block_stop(index)
-            continue
-        if has_native_reasoning:
-            continue
-        text = _reasoning_detail_text(detail)
-        if not text:
-            continue
-        yield from ledger.ensure_thinking_block()
-        yield ledger.emit_thinking_delta(text)
-
-
-def _reasoning_detail_text(detail: Any) -> str | None:
-    kind = str(_field(detail, "type") or "").lower()
-    if "encrypted" in kind or "redacted" in kind:
-        return None
-    for key in ("text", "content", "reasoning"):
-        value = _field(detail, key)
-        if isinstance(value, str) and value:
-            return value
-    return None
-
-
-def _reasoning_detail_encrypted(detail: Any) -> str | None:
-    kind = str(_field(detail, "type") or "").lower()
-    if "encrypted" not in kind and "redacted" not in kind and "summary" not in kind:
-        return None
-    if isinstance(detail, Mapping):
-        return json.dumps(dict(detail), separators=(",", ":"))
-    return None
-
-
-def _json_payload(value: str) -> Any:
-    try:
-        return json.loads(value)
-    except json.JSONDecodeError:
-        return None
-
-
-def _field(item: Any, name: str) -> Any:
-    if isinstance(item, Mapping):
-        return item.get(name)
-    return getattr(item, name, None)
-
-
-def _is_sequence(value: Any) -> bool:
-    return isinstance(value, Sequence) and not isinstance(
-        value, str | bytes | bytearray
-    )

@@ -1,26 +1,22 @@
 """Provider-owned stream holdback and recovery decisions."""
 
+import asyncio
 import time
-from collections.abc import Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import Enum, StrEnum, auto
 
-import httpx
-import openai
+from free_claude_code.core.async_tasks import wait_owned
+from free_claude_code.core.stream_delivery import StreamDeliveryState
 
-from free_claude_code.core.failures import ExecutionFailure
-from free_claude_code.core.trace import trace_event
+from .failure_policy import RetryableProviderProtocolError
 
-from .failure_policy import retryable_transient_status
-
-EARLY_TRANSPARENT_TOTAL_ATTEMPTS = 5
-EARLY_TRANSPARENT_MAX_RETRIES = EARLY_TRANSPARENT_TOTAL_ATTEMPTS - 1
-MIDSTREAM_RECOVERY_ATTEMPTS = 5
 EARLY_HOLDBACK_SECONDS = 0.75
 RECOVERY_BUFFER_MAX_BYTES = 65_536
 
 
-class TruncatedProviderStreamError(RuntimeError):
+class TruncatedProviderStreamError(RetryableProviderProtocolError):
     """An upstream stream ended without its required terminal marker."""
 
 
@@ -32,6 +28,12 @@ class RecoveryFailureAction(StrEnum):
     FINAL_ERROR = "final_error"
 
 
+class HoldbackSignal(Enum):
+    """Wake a transport to release its buffer without cancelling its read."""
+
+    EXPIRED = auto()
+
+
 @dataclass(frozen=True, slots=True)
 class RecoveryDecision:
     """Failure decision for one provider stream attempt."""
@@ -40,8 +42,6 @@ class RecoveryDecision:
     retryable: bool
     committed: bool
     has_buffered: bool
-    early_retry_attempt: int | None = None
-    midstream_recovery_attempt: int | None = None
 
 
 class RecoveryHoldbackBuffer:
@@ -95,38 +95,102 @@ class RecoveryHoldbackBuffer:
     def has_buffered(self) -> bool:
         return bool(self._events)
 
+    @property
+    def remaining_delay(self) -> float | None:
+        if self.committed or self._started_at is None:
+            return None
+        return max(0.0, self._holdback_seconds - (self._now() - self._started_at))
+
+
+class _HoldbackReader[EventT](AsyncIterator[EventT | HoldbackSignal]):
+    """Borrow a source and retain only the read interrupted by a buffer deadline."""
+
+    def __init__(
+        self, source: AsyncIterator[EventT], remaining_delay: Callable[[], float | None]
+    ) -> None:
+        self._source = source
+        self._remaining_delay = remaining_delay
+        self._pending: asyncio.Task[EventT] | None = None
+        self._deadline_checked = False
+
+    def __aiter__(self) -> _HoldbackReader[EventT]:
+        return self
+
+    async def __anext__(self) -> EventT | HoldbackSignal:
+        pending = self._pending
+        delay = self._remaining_delay()
+        if pending is not None and pending.done():
+            self._pending = None
+            self._deadline_checked = delay == 0
+            return pending.result()
+        # Check one ready event at expiry, then release even if it was metadata.
+        if delay == 0 and self._deadline_checked:
+            return HoldbackSignal.EXPIRED
+        if pending is None:
+            if delay is None:
+                return await anext(self._source)
+            pending = self._pending = asyncio.create_task(self._read())
+        await asyncio.wait({pending}, timeout=delay)
+        if pending.done():
+            self._pending = None
+            self._deadline_checked = self._remaining_delay() == 0
+            return pending.result()
+        return HoldbackSignal.EXPIRED
+
+    async def _read(self) -> EventT:
+        return await anext(self._source)
+
+    async def aclose(self) -> None:
+        pending, self._pending = self._pending, None
+        if pending is None:
+            return
+        if not pending.done():
+            pending.cancel()
+
+        async def drain() -> None:
+            await asyncio.gather(pending, return_exceptions=True)
+
+        await wait_owned(asyncio.create_task(drain()))
+
 
 class RecoveryController:
-    """Own holdback and retry counters for one provider stream lifecycle."""
+    """Use public delivery evidence; retain holdback only for private consumers."""
 
-    def __init__(self, *, provider_name: str, request_id: str | None) -> None:
-        self._provider_name = provider_name
-        self._request_id = request_id
+    def __init__(self, delivery: StreamDeliveryState | None = None) -> None:
         self._holdback = RecoveryHoldbackBuffer()
-        self._early_retry_count = 0
-        self._midstream_recovery_count = 0
+        self._delivery = delivery
 
     @property
     def committed(self) -> bool:
-        return self._holdback.committed
+        return (
+            self._delivery.content_released
+            if self._delivery is not None
+            else self._holdback.committed
+        )
 
     @property
     def has_buffered(self) -> bool:
-        return self._holdback.has_buffered
+        return self._delivery is None and self._holdback.has_buffered
 
     @property
-    def early_retries(self) -> int:
-        return self._early_retry_count
+    def remaining_delay(self) -> float | None:
+        return self._holdback.remaining_delay if self._delivery is None else None
 
-    @property
-    def midstream_recoveries(self) -> int:
-        return self._midstream_recovery_count
+    @asynccontextmanager
+    async def read_stream[EventT](
+        self, source: AsyncIterator[EventT]
+    ) -> AsyncGenerator[_HoldbackReader[EventT]]:
+        reader = _HoldbackReader(source, lambda: self.remaining_delay)
+        try:
+            yield reader
+        finally:
+            await reader.aclose()
 
     def push(self, event: str) -> list[str]:
-        return self._holdback.push(event)
+        return self._holdback.push(event) if self._delivery is None else [event]
 
     def flush(self) -> list[str]:
-        return self._holdback.flush()
+        return self._holdback.flush() if self._delivery is None else []
 
     def discard(self) -> None:
         self._holdback.discard()
@@ -138,55 +202,60 @@ class RecoveryController:
 
     def advance_failure(
         self,
-        error: BaseException,
         *,
+        retryable: bool,
         stream_opened: bool,
         generated_output: bool,
         complete_tool_salvageable: bool,
+        attempts_remaining: int,
+        normal_stop_seen: bool = False,
     ) -> RecoveryDecision:
-        retryable = is_retryable_stream_error(error)
-        committed = self._holdback.committed
-        has_buffered = self._holdback.has_buffered
+        committed = self.committed
+        has_buffered = self.has_buffered
+        retry_available = attempts_remaining > 0
+        reserve_last_attempt_for_recovery = generated_output and attempts_remaining == 1
+
+        public_hidden = (
+            self._delivery is not None and not self._delivery.content_released
+        )
 
         if (
-            retryable
+            stream_opened
+            and can_retry_undelivered_stream(
+                self._delivery,
+                retryable=retryable,
+                attempts_remaining=attempts_remaining,
+                normal_stop_seen=normal_stop_seen,
+            )
+        ) or (
+            not public_hidden
+            and retryable
+            and retry_available
             and stream_opened
             and not committed
             and not complete_tool_salvageable
-            and self._early_retry_count < EARLY_TRANSPARENT_MAX_RETRIES
+            and not reserve_last_attempt_for_recovery
         ):
-            self._early_retry_count += 1
             self._holdback.discard()
             self._holdback = RecoveryHoldbackBuffer()
-            trace_event(
-                stage="provider",
-                event="provider.recovery.early_retry",
-                source="provider",
-                provider=self._provider_name,
-                request_id=self._request_id,
-                retry_attempt=self._early_retry_count,
-                retryable=True,
-            )
             return RecoveryDecision(
                 action=RecoveryFailureAction.EARLY_RETRY,
                 retryable=True,
                 committed=False,
                 has_buffered=has_buffered,
-                early_retry_attempt=self._early_retry_count,
             )
 
         if (
-            retryable
+            not public_hidden
+            and retryable
             and generated_output
-            and self._midstream_recovery_count < MIDSTREAM_RECOVERY_ATTEMPTS
+            and (retry_available or complete_tool_salvageable)
         ):
-            self._midstream_recovery_count += 1
             return RecoveryDecision(
                 action=RecoveryFailureAction.MIDSTREAM_RECOVERY,
                 retryable=True,
                 committed=committed,
                 has_buffered=has_buffered,
-                midstream_recovery_attempt=self._midstream_recovery_count,
             )
 
         return RecoveryDecision(
@@ -197,26 +266,18 @@ class RecoveryController:
         )
 
 
-def is_retryable_stream_error(exc: BaseException) -> bool:
-    """Return whether one stream failure qualifies for retry or recovery."""
-    if isinstance(exc, TruncatedProviderStreamError):
-        return True
-    if isinstance(exc, ExecutionFailure):
-        return exc.retryable
-    if isinstance(exc, openai.AuthenticationError | openai.BadRequestError):
-        return False
-    if retryable_transient_status(exc) is not None:
-        return True
-    return isinstance(
-        exc,
-        (
-            TimeoutError,
-            httpx.ReadTimeout,
-            httpx.ReadError,
-            httpx.RemoteProtocolError,
-            httpx.ConnectError,
-            httpx.NetworkError,
-            openai.APITimeoutError,
-            openai.APIConnectionError,
-        ),
+def can_retry_undelivered_stream(
+    delivery: StreamDeliveryState | None,
+    *,
+    retryable: bool,
+    attempts_remaining: int,
+    normal_stop_seen: bool,
+) -> bool:
+    """A clean restart is safe only before content and a normal model stop."""
+    return (
+        delivery is not None
+        and not delivery.content_released
+        and retryable
+        and attempts_remaining > 0
+        and not normal_stop_seen
     )

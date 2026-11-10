@@ -8,10 +8,20 @@ from typing import Any, Literal
 from loguru import logger
 
 from free_claude_code.application.errors import InvalidRequestError
-from free_claude_code.core.anthropic import ReasoningReplayMode, build_base_request_body
+from free_claude_code.core.anthropic import (
+    ReasoningReplayMode,
+    build_base_request_body,
+)
 from free_claude_code.core.anthropic.conversion import OpenAIConversionError
 from free_claude_code.core.anthropic.models import MessagesRequest
+from free_claude_code.core.openai_tool_names import (
+    OpenAIToolNameCodec,
+    encode_openai_chat_tool_names,
+)
 from free_claude_code.core.reasoning import ReasoningPolicy
+from free_claude_code.providers.history_replay import (
+    normalize_messages_history,
+)
 
 MaxTokensField = Literal["max_tokens", "max_completion_tokens"]
 OpenAIChatPostprocessor = Callable[
@@ -42,8 +52,10 @@ def build_openai_chat_request_body(
     reasoning: ReasoningPolicy,
     policy: OpenAIChatRequestPolicy,
     postprocessors: Iterable[OpenAIChatPostprocessor] = (),
+    structured_reasoning_details: bool = False,
 ) -> dict[str, Any]:
     """Build an OpenAI-compatible chat request body from an Anthropic request."""
+    request_data = normalize_messages_history(request_data)
     logger.debug(
         "{}_REQUEST: conversion start model={} msgs={}",
         policy.provider_name,
@@ -55,6 +67,7 @@ def build_openai_chat_request_body(
             request_data,
             default_max_tokens=policy.default_max_tokens,
             reasoning_replay=policy.reasoning_replay,
+            structured_reasoning_details=structured_reasoning_details,
         )
     except OpenAIConversionError as exc:
         raise InvalidRequestError(str(exc)) from exc
@@ -72,10 +85,12 @@ def build_openai_chat_request_body(
                     raise InvalidRequestError(str(exc)) from exc
             body["extra_body"] = extra_body
 
-    _apply_common_openai_chat_policy(body, policy)
+    apply_openai_chat_body_policy(body, policy)
 
     for postprocess in postprocessors:
         postprocess(body, request_data, reasoning)
+
+    encode_openai_chat_tool_names(body, OpenAIToolNameCodec.from_request(request_data))
 
     logger.debug(
         "{}_REQUEST: conversion done model={} msgs={} tools={}",
@@ -87,14 +102,24 @@ def build_openai_chat_request_body(
     return body
 
 
-def _apply_common_openai_chat_policy(
+def apply_openai_chat_body_policy(
     body: dict[str, Any], policy: OpenAIChatRequestPolicy
 ) -> None:
+    """Apply source-independent Chat Completions body policy."""
     if policy.strip_message_names:
         _strip_message_names(body.get("messages"))
 
     for key in policy.unsupported_body_keys:
         body.pop(key, None)
+
+    # unsupported_body_keys must also be stripped from a caller-supplied
+    # extra_body: it becomes the SDK's own extra_body= kwarg and gets merged
+    # into the wire-level JSON verbatim, so a key unsupported at the top
+    # level is equally unsupported when it arrives this way (#1548).
+    extra_body = body.get("extra_body")
+    if isinstance(extra_body, dict):
+        for key in policy.unsupported_body_keys:
+            extra_body.pop(key, None)
 
     if policy.max_tokens_field == "max_completion_tokens":
         _normalize_max_completion_tokens(body)

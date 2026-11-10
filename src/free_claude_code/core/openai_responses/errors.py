@@ -7,6 +7,7 @@ from free_claude_code.core.failures import ExecutionFailure, FailureKind
 
 _FAILURE_ERROR_TYPES = {
     FailureKind.INVALID_REQUEST: "invalid_request_error",
+    FailureKind.CONTEXT_WINDOW_EXCEEDED: "invalid_request_error",
     FailureKind.AUTHENTICATION: "authentication_error",
     FailureKind.PERMISSION: "permission_error",
     FailureKind.RATE_LIMIT: "rate_limit_error",
@@ -41,7 +42,12 @@ def openai_error_type_for_failure(
     return _FAILURE_ERROR_TYPES[kind]
 
 
-def openai_error_payload(*, message: str, error_type: str) -> dict[str, Any]:
+def openai_error_payload(
+    *,
+    message: str,
+    error_type: str,
+    code: str | None = None,
+) -> dict[str, Any]:
     """Return an OpenAI-compatible error envelope."""
 
     return {
@@ -49,7 +55,7 @@ def openai_error_payload(*, message: str, error_type: str) -> dict[str, Any]:
             "message": redact_sensitive_error_text(message),
             "type": error_type,
             "param": None,
-            "code": None,
+            "code": code,
         }
     }
 
@@ -59,6 +65,11 @@ def openai_error_from_failure(failure: ExecutionFailure) -> dict[str, Any]:
     return openai_error_payload(
         message=failure.message,
         error_type=openai_error_type_for_failure(failure),
+        code=(
+            "context_length_exceeded"
+            if failure.kind is FailureKind.CONTEXT_WINDOW_EXCEEDED
+            else None
+        ),
     )["error"]
 
 
